@@ -6,6 +6,7 @@ package dns
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,29 +27,7 @@ func wslDistros() ([]string, error) {
 		return nil, fmt.Errorf("%v: %q", err, string(b))
 	}
 
-	// The first line of output is a WSL header. E.g.
-	//
-	//	C:\tsdev>wsl.exe -l
-	//	Windows Subsystem for Linux Distributions:
-	//	Ubuntu-20.04 (Default)
-	//
-	// We can skip it by passing '-q', but here we put it to work.
-	// It turns out wsl.exe -l is broken, and outputs UTF-16 names
-	// that nothing can read. (Try `wsl.exe -l | more`.)
-	// So we look at the header to see if it's UTF-16.
-	// If so, we run the rest through a UTF-16 parser.
-	//
-	// https://github.com/microsoft/WSL/issues/4607
-	var output string
-	if bytes.HasPrefix(b, []byte("W\x00i\x00n\x00d\x00o\x00w\x00s\x00")) {
-		output, err = decodeUTF16(b)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decode wsl.exe -l output %q: %v", b, err)
-		}
-	} else {
-		output = string(b)
-	}
-	lines := strings.Split(output, "\n")
+	lines := strings.Split(string(b), "\n")
 	if len(lines) < 1 {
 		return nil, nil
 	}
@@ -66,17 +45,17 @@ func wslDistros() ([]string, error) {
 	return distros, nil
 }
 
-func decodeUTF16(b []byte) (string, error) {
+func decodeUTF16(b []byte, endian binary.ByteOrder) ([]byte, error) {
 	if len(b) == 0 {
-		return "", nil
+		return nil, nil
 	} else if len(b)%2 != 0 {
-		return "", fmt.Errorf("decodeUTF16: invalid length %d", len(b))
+		return nil, fmt.Errorf("decodeUTF16: invalid length %d", len(b))
 	}
 	var u16 []uint16
 	for i := 0; i < len(b); i += 2 {
-		u16 = append(u16, uint16(b[i])+(uint16(b[i+1])<<8))
+		u16 = append(u16, endian.Uint16(b[i:]))
 	}
-	return string(utf16.Decode(u16)), nil
+	return []byte(string(utf16.Decode(u16))), nil
 }
 
 // wslManager is a DNS manager for WSL2 linux distributions.
@@ -225,7 +204,34 @@ func wslCombinedOutput(cmd *exec.Cmd) ([]byte, error) {
 	cmd.Stdout = buf
 	cmd.Stderr = buf
 	err := wslRun(cmd)
-	return buf.Bytes(), err
+
+	// Some of wsl.exe's output get printed as UTF-16, which breaks a
+	// bunch of things. Try to detect this by looking for a zero byte
+	// in the first few bytes of output (which will appear if any of
+	// those codepoints are basic ASCII - very likely). From that we
+	// can infer that UTF-16 is being printed, and the byte order in
+	// use, and we decode that back to UTF-8.
+	//
+	// https://github.com/microsoft/WSL/issues/4607
+	ret := buf.Bytes()
+	checkLen := 20
+	if len(ret) < checkLen {
+		checkLen = len(ret)
+	}
+	if zeroOff := bytes.IndexByte(ret[:checkLen], 0); zeroOff != -1 {
+		// We assume wsl.exe is trying to print an ascii codepoint,
+		// meaning the zero byte is in the upper 8 bits of the
+		// codepoint. That means we can use the zero's byte offset to
+		// work out if we're seeing little-endian or big-endian
+		// UTF-16.
+		var endian binary.ByteOrder = binary.LittleEndian
+		if zeroOff%2 == 0 {
+			endian = binary.BigEndian
+		}
+		return decodeUTF16(ret, endian)
+	}
+
+	return ret, err
 }
 
 func wslRun(cmd *exec.Cmd) (err error) {
